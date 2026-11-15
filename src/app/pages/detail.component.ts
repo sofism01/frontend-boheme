@@ -1,0 +1,31 @@
+import { Component, inject, signal } from '@angular/core';
+import { ActivatedRoute, Router, RouterLink } from '@angular/router';
+import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+import { catchError, finalize, of, switchMap } from 'rxjs';
+import { CatalogService } from '../core/catalog.service';
+import { AuthService } from '../core/auth.service';
+import { BagService } from '../core/bag.service';
+import { FavoritesService } from '../core/favorites.service';
+import { NotificationsService } from '../core/notifications.service';
+import { Prenda } from '../core/models';
+import { MoneyPipe } from '../shared/money.pipe';
+import { StatusComponent } from '../shared/status.component';
+@Component({ imports: [RouterLink, ReactiveFormsModule, MoneyPipe, StatusComponent], template: `
+  <section class="page-gutter page-section"><a class="text-link" routerLink="/catalogo">← Volver a la colección</a><app-status [loading]="loading()" [error]="error()" subject="la prenda" (retry)="load()" />
+  @if (product(); as p) { <div class="row g-5 mt-2"><div class="col-lg-6"><div class="detail-visual"><span class="eyebrow">PRENDA DE AUTOR</span><span class="detail-letter" aria-hidden="true">b.</span><span>Fotografía no disponible</span></div></div><div class="col-lg-6 detail-copy"><span class="eyebrow">LA COLECCIÓN / DETALLE</span><h1>{{ p.nombre }}</h1><p class="detail-price">{{ p.precioBase | money }}</p><p class="description">{{ p.descripcion }}</p><span class="badge text-bg-light mb-4">{{ p.disponibleParaLaVenta ? 'Disponible para la venta' : 'Venta suspendida' }}</span>
+  <form [formGroup]="form" (ngSubmit)="add()"><label class="form-label" for="variant">Talla / variante</label><select id="variant" class="form-select" formControlName="varianteId"><option value="">Elige una variante</option>@for (v of p.variantes; track v.varianteId) { <option [value]="v.varianteId" [disabled]="v.stockDisponible < 1">{{ v.tipoTalla }} · {{ v.sku }} · {{ v.stockDisponible }} disponibles</option> }</select><p class="field-error">@if (form.controls.varianteId.touched && form.controls.varianteId.invalid) { Elige una variante disponible. }</p><label for="amount" class="form-label">Cantidad</label><input id="amount" class="form-control quantity-input" type="number" min="1" [max]="selectedStock()" step="1" formControlName="cantidad"><p class="field-error">@if (form.controls.cantidad.touched && form.controls.cantidad.invalid) { Indica una cantidad entera mayor que cero. }</p>
+  @if (!auth.user() || auth.user()?.rol === 'COMPRADOR') { <button type="submit" class="btn btn-dark w-100" [disabled]="busy() || !p.disponibleParaLaVenta || !hasStock()">{{ busy() ? 'Añadiendo…' : 'Añadir a mi bolsa ↗' }}</button><button type="button" class="btn btn-outline-dark w-100 mt-3" [disabled]="favoriteBusy()" (click)="favorite()">{{ favoriteBusy() ? 'Guardando…' : 'Guardar en favoritos ♡' }}</button> } @else { <p class="small text-secondary">Estás explorando con una cuenta de vendedor.</p> }
+  </form><div class="detail-footnote">La disponibilidad se comprueba al confirmar el pedido. Los precios se muestran en la moneda de cada prenda.</div><p class="small text-secondary text-break mt-3">Creador: {{ p.creadorId }}</p></div></div> }</section>` })
+export class DetailComponent {
+  readonly auth = inject(AuthService); private readonly api = inject(CatalogService); private readonly bags = inject(BagService); private readonly favorites = inject(FavoritesService); private readonly notices = inject(NotificationsService); private readonly route = inject(ActivatedRoute); private readonly router = inject(Router);
+  readonly product = signal<Prenda | null>(null); readonly loading = signal(true); readonly error = signal(''); readonly busy = signal(false); readonly favoriteBusy = signal(false);
+  readonly form = inject(FormBuilder).nonNullable.group({ varianteId: ['', Validators.required], cantidad: [1, [Validators.required, Validators.min(1), Validators.pattern(/^\d+$/)]] });
+  constructor() { this.route.paramMap.pipe(switchMap(params => { this.loading.set(true); this.product.set(null); this.error.set(''); return this.api.detail(params.get('id') || '').pipe(catchError(e => { this.error.set(e.status === 404 ? 'Esta prenda no existe o ya no está en la colección.' : 'No pudimos consultar esta prenda.'); return of(null); })); }), takeUntilDestroyed()).subscribe(p => { this.product.set(p); this.loading.set(false); this.form.reset({ varianteId: '', cantidad: 1 }); }); }
+  load() { this.loading.set(true); this.error.set(''); this.api.detail(this.route.snapshot.paramMap.get('id') || '').pipe(finalize(() => this.loading.set(false))).subscribe({ next: p => this.product.set(p), error: e => this.error.set(e.status === 404 ? 'Esta prenda no existe o ya no está en la colección.' : 'No pudimos consultar esta prenda.') }); }
+  selectedStock() { return this.product()?.variantes.find(v => v.varianteId === this.form.controls.varianteId.value)?.stockDisponible ?? 0; }
+  hasStock() { return this.product()?.variantes.some(v => v.stockDisponible > 0) ?? false; }
+  private login() { void this.router.navigate(['/login'], { queryParams: { returnUrl: this.router.url } }); }
+  add() { if (!this.auth.valid()) { this.login(); return; } this.form.markAllAsTouched(); if (this.form.invalid || this.busy() || !this.product()?.disponibleParaLaVenta) return; const { varianteId, cantidad } = this.form.getRawValue(); if (cantidad > this.selectedStock()) { this.notices.show('La cantidad supera las existencias de esta variante.', 'danger'); return; } this.busy.set(true); this.bags.addForUser(this.auth.user()!.id, varianteId, cantidad).pipe(finalize(() => this.busy.set(false))).subscribe({ next: () => this.notices.show('Prenda añadida a tu bolsa.'), error: e => this.notices.error(e) }); }
+  favorite() { if (!this.auth.valid()) { this.login(); return; } if (this.favoriteBusy()) return; this.favoriteBusy.set(true); this.favorites.add(this.product()!.prendaId).pipe(finalize(() => this.favoriteBusy.set(false))).subscribe({ next: () => this.notices.show('Prenda guardada en tus favoritos.'), error: e => e.status === 409 ? this.notices.show('Esta prenda ya está en tus favoritos.', 'info') : this.notices.error(e) }); }
+}

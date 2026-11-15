@@ -1,0 +1,26 @@
+import { beforeEach, describe, expect, it, vi, afterEach } from 'vitest';
+import { TestBed } from '@angular/core/testing';
+import { HttpClient, provideHttpClient, withInterceptors } from '@angular/common/http';
+import { HttpTestingController, provideHttpClientTesting } from '@angular/common/http/testing';
+import { Router } from '@angular/router';
+import { AuthService } from './auth.service';
+import { authInterceptor } from './auth.interceptor';
+import { NotificationsService } from './notifications.service';
+import { Sesion } from './models';
+describe('Authorization and session races', () => {
+  let auth: AuthService, client: HttpClient, http: HttpTestingController;
+  const navigate=vi.fn(), show=vi.fn();
+  const login=(token='old') => { const rol='COMPRADOR'; const s: Sesion={ token, tokenType:'Bearer', expiresAt:new Date(Date.now()+3600000).toISOString(), expiresIn:3600, rol, usuario:{id:'id',nombre:'Ana',correo:'a@b.co',rol,activo:true} }; auth.session.set(s); return s; };
+  const get=(url='/api/pedidos') => client.get(url).subscribe({error:()=>{}});
+  const unauthorized=(url:string) => http.expectOne(url).flush({}, {status:401,statusText:'Unauthorized'});
+  beforeEach(()=>{ vi.clearAllMocks(); localStorage.clear(); TestBed.configureTestingModule({providers:[provideHttpClient(withInterceptors([authInterceptor])),provideHttpClientTesting(),{provide:Router,useValue:{url:'/compras',navigate}},{provide:NotificationsService,useValue:{show}}]}); auth=TestBed.inject(AuthService);client=TestBed.inject(HttpClient);http=TestBed.inject(HttpTestingController); });
+  afterEach(()=>http.verify());
+  it('attaches exactly one Bearer header to API requests',()=>{login();client.get('/api/pedidos',{headers:{Authorization:'stale'}}).subscribe();const r=http.expectOne('/api/pedidos');expect(r.request.headers.getAll('Authorization')).toEqual(['Bearer old']);r.flush([]);});
+  it.each(['/api/auth/login','/api/auth/register','https://external.test/api/pedidos'])('does not attach token or expire on 401 for %s',url=>{login();get(url);const r=http.expectOne(url);expect(r.request.headers.has('Authorization')).toBe(false);r.flush({},{status:401,statusText:'Unauthorized'});expect(auth.session()?.token).toBe('old');expect(show).not.toHaveBeenCalled();});
+  it('expires a rejected session and preserves the error',()=>{login();const error=vi.fn();client.get('/api/pedidos').subscribe({error});unauthorized('/api/pedidos');expect(auth.session()).toBeNull();expect(show).toHaveBeenCalledTimes(1);expect(navigate).toHaveBeenCalledWith(['/login'],{queryParams:{returnUrl:'/compras'}});expect(error.mock.calls[0][0].status).toBe(401);});
+  it('notifies once for concurrent 401 responses',()=>{login();get('/api/a');get('/api/b');unauthorized('/api/a');unauthorized('/api/b');expect(show).toHaveBeenCalledTimes(1);expect(navigate).toHaveBeenCalledTimes(1);});
+  it('does not logout a new session when an old request returns 401',()=>{login();get();login('new');unauthorized('/api/pedidos');expect(auth.session()?.token).toBe('new');expect(show).not.toHaveBeenCalled();});
+  it('does not notify repeatedly for anonymous 401 responses',()=>{get('/api/a');get('/api/b');unauthorized('/api/a');unauthorized('/api/b');expect(show).not.toHaveBeenCalled();expect(navigate).not.toHaveBeenCalled();});
+  it('expires a locally expired session once without sending its token',()=>{const s=login();auth.session.set({...s,expiresAt:'2000-01-01T00:00:00Z'});get();const r=http.expectOne('/api/pedidos');expect(r.request.headers.has('Authorization')).toBe(false);r.flush({},{status:401,statusText:'Unauthorized'});expect(show).toHaveBeenCalledTimes(1);expect(auth.session()).toBeNull();});
+  it('does not expire on forbidden responses',()=>{login();get();http.expectOne('/api/pedidos').flush({},{status:403,statusText:'Forbidden'});expect(auth.session()?.token).toBe('old');expect(show).not.toHaveBeenCalled();});
+});
